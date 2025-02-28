@@ -6,14 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
+    // "net/url"
 	"os"
 	"strings"
 	"time"
 
 	"golang.org/x/term"
 	"nhooyr.io/websocket"
-	"subtrace.dev/pubsub"
+	// "subtrace.dev/pubsub"
 	"subtrace.dev/rpc"
 )
 
@@ -24,56 +24,31 @@ type publisher struct {
 }
 
 func (p *publisher) dialSingle(ctx context.Context) (*websocket.Conn, string, error) {
-	req := &pubsub.JoinPublisher_Request{}
+    websocketUrl := os.Getenv("MYLOG_WEBSOCKET_URL")
+    displayUrl := "You can check the log at your cw logs console"
+    
+    conn, resp, err := websocket.Dial(ctx, websocketUrl, &websocket.DialOptions{
+        HTTPClient: http.DefaultClient,
+        HTTPHeader: rpc.GetHeader(),
+    })
+    if err != nil {
+        if resp != nil {
+            defer resp.Body.Close()
+        }
+        return nil, "", fmt.Errorf("dial: %w", err)
+    }
 
-	var opts []rpc.Option
-	if os.Getenv("SUBTRACE_TOKEN") == "" {
-		linkID := os.Getenv("SUBTRACE_LINK_ID_OVERRIDE")
-		if linkID != "" {
-			req.LinkIdOverride = &linkID
-		}
+    conn.SetReadLimit(1 << 24)
 
-		opts = append(opts, rpc.WithoutToken())
-	} else {
-		opts = append(opts, rpc.WithToken())
-	}
+    go func() {
+        for {
+            if _, _, err := conn.Read(context.Background()); err != nil {
+                return
+            }
+        }
+    }()
 
-	var pub pubsub.JoinPublisher_Response
-	if code, err := rpc.Call(ctx, &pub, "/api/JoinPublisher", req, opts...); err != nil {
-		return nil, "", fmt.Errorf("call JoinPublisher: %w", err)
-	} else if code != http.StatusOK || (pub.Error != nil && *pub.Error != "") {
-		err := fmt.Errorf("JoinPublisher: %s", http.StatusText(code))
-		if pub.Error != nil && *pub.Error != "" {
-			err = fmt.Errorf("%w: %s", err, *pub.Error)
-		}
-		return nil, "", err
-	}
-
-	u, err := url.Parse(pub.WebsocketUrl)
-	if err != nil {
-		return nil, "", fmt.Errorf("parse url: %w", err)
-	}
-
-	conn, resp, err := websocket.Dial(ctx, pub.WebsocketUrl, &websocket.DialOptions{
-		HTTPClient: http.DefaultClient,
-		HTTPHeader: rpc.GetHeader(),
-	})
-	if err != nil {
-		defer resp.Body.Close()
-		return nil, "", fmt.Errorf("dial: %w", err)
-	}
-
-	conn.SetReadLimit(1 << 24)
-
-	go func() {
-		for {
-			if _, _, err := conn.Read(context.Background()); err != nil {
-				return
-			}
-		}
-	}()
-
-	return conn, u.Query().Get("url"), nil
+    return conn, displayUrl, nil
 }
 
 func (p *publisher) wait(ctx context.Context, dur time.Duration) bool {
