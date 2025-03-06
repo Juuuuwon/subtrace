@@ -6,6 +6,7 @@ package tracer
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -19,13 +20,15 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/google/martian/v3/har"
-	"google.golang.org/protobuf/proto"
 	"subtrace.dev/cmd/run/journal"
 	"subtrace.dev/event"
 	"subtrace.dev/filter"
 	"subtrace.dev/global"
-	"subtrace.dev/pubsub"
 	"subtrace.dev/stats"
 )
 
@@ -74,13 +77,6 @@ func (p *Parser) UseRequest(req *http.Request) {
 		if err != nil {
 			p.errs <- fmt.Errorf("parse HAR request: %w", err)
 			return
-		}
-
-		for i := range h.Headers {
-			switch strings.ToLower(h.Headers[i].Name) {
-			case "authorization", "cookie":
-				h.Headers[i].Value = p.global.Config.SantizeCredential(h.Headers[i].Value)
-			}
 		}
 
 		start := time.Now()
@@ -222,11 +218,6 @@ func (p *Parser) Finish() error {
 		return err
 	}
 
-	var loglines []string
-	if journal.Enabled {
-		loglines = p.global.Journal.CopyFrom(p.journalIdx)
-	}
-
 	entry := &har.Entry{
 		ID:              p.event.Get("event_id"),
 		StartedDateTime: p.begin.UTC(),
@@ -268,7 +259,7 @@ func (p *Parser) Finish() error {
 		sendReflector, sendTunneler = true, false
 	}
 	if sendReflector {
-		if err := p.sendReflector(tags, json, loglines); err != nil {
+		if err := p.sendReflector(tags, json); err != nil {
 			slog.Error("failed to publish event to reflector", "eventID", p.event.Get("event_id"), "err", err)
 		}
 	}
@@ -280,37 +271,231 @@ func (p *Parser) Finish() error {
 	return nil
 }
 
-func (p *Parser) sendReflector(tags map[string]string, json []byte, loglines []string) error {
-	b, err := proto.Marshal(&pubsub.Message{
-		Concrete: &pubsub.Message_ConcreteV1{
-			ConcreteV1: &pubsub.Message_V1{
-				Underlying: &pubsub.Message_V1_Event{
-					Event: &pubsub.Event{
-						Concrete: &pubsub.Event_ConcreteV1{
-							ConcreteV1: &pubsub.Event_V1{
-								Tags:         tags,
-								HarEntryJson: json,
-								Log: &pubsub.Event_Log{
-									Lines: loglines,
-									Index: p.journalIdx + 1,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("marshal proto: %w", err)
-	}
+// 수정----------------------------------------------------------------------------------------------
+// generateCurlCommand는 request 객체를 기반으로 curl 명령어를 생성합니다.
+func generateCurlCommand(request map[string]interface{}) string {
+    method, _ := request["method"].(string)
+    url, _ := request["url"].(string)
+    headers, _ := request["headers"].([]map[string]string)
+    postData, _ := request["postData"].(map[string]interface{})
 
-	select {
-	case DefaultPublisher.ch <- b:
-		return nil
-	default:
-		return fmt.Errorf("publisher channel buffer full")
-	}
+    // 1. Host 헤더에서 호스트 정보를 추출하여 URL에 포함
+    host := ""
+    for _, header := range headers {
+        for name, value := range header {
+            if strings.ToLower(name) == "host" {
+                host = value
+                break
+            }
+        }
+        if host != "" {
+            break
+        }
+    }
+    if host != "" {
+        url = host + url // 예: localhost:8080/path
+    }
+
+    // 2. curl 명령어 초기화
+    curl := "curl -X " + method
+
+    // 3. POST 데이터 추가 (-d를 앞으로 배치)
+    if method == "POST" && postData != nil {
+        text, _ := postData["text"].(string)
+        curl += " -d " + text
+    }
+
+    // 4. 헤더 추가 (Host와 Content-Length 제외, 작은따옴표 사용)
+    for _, header := range headers {
+        for name, value := range header {
+            lowerName := strings.ToLower(name)
+            if lowerName != "host" && lowerName != "content-length" {
+                curl += " -H '" + name + ": " + value + "'"
+            }
+        }
+    }
+
+    // 5. URL을 작은따옴표로 감싸고 마지막에 추가
+    curl += " '" + url + "'"
+
+    return curl
+}
+
+func transformJSON(input []byte) ([]byte) {
+    // JSON을 map으로 파싱
+    var data map[string]interface{}
+    if err := json.Unmarshal(input, &data); err != nil {
+        return nil
+    }
+
+    // 1. .timings 필드 제거
+    delete(data, "timings")
+
+    // 2. ._id 필드 제거
+    delete(data, "_id")
+
+    // 3. .time 필드를 .a-response-time으로 이름 변경
+    if timeVal, exists := data["time"]; exists {
+        data["a-response-time"] = timeVal
+        delete(data, "time")
+    }
+
+    // 4. .request.headers 변환 및 curl-command 추가
+    if request, ok := data["request"].(map[string]interface{}); ok {
+        // 헤더 변환
+        if headers, ok := request["headers"].([]interface{}); ok {
+            newHeaders := make([]map[string]string, 0, len(headers))
+            for _, header := range headers {
+                if h, ok := header.(map[string]interface{}); ok {
+                    name, _ := h["name"].(string)
+                    value, _ := h["value"].(string)
+                    if name == "" && value == "" { // 이미 변환된 경우
+                        for k, v := range h {
+                            newHeaders = append(newHeaders, map[string]string{k: v.(string)})
+                        }
+                    } else {
+                        newHeaders = append(newHeaders, map[string]string{name: value})
+                    }
+                }
+            }
+            request["headers"] = newHeaders
+        }
+
+        // 5. headersSize, bodySize 제거
+        delete(request, "headersSize")
+        delete(request, "bodySize")
+
+        // 6. curl-command 생성 및 추가
+        curlCommand := generateCurlCommand(request)
+        data["curl-command"] = curlCommand
+    }
+
+    // 7. .response 처리
+    if response, ok := data["response"].(map[string]interface{}); ok {
+        delete(response, "headersSize")
+        delete(response, "bodySize")
+
+        // base64 디코딩 및 response.content.text를 response.content로 복사
+        if content, ok := response["content"].(map[string]interface{}); ok {
+            if encoding, ok := content["encoding"].(string); ok && encoding == "base64" {
+                if text, ok := content["text"].(string); ok {
+                    decoded, err := base64.StdEncoding.DecodeString(text)
+                    if err == nil {
+                        content["text"] = string(decoded)
+                    }
+                }
+            }
+            // response.content를 response.content.text로 대체
+            if text, ok := content["text"].(string); ok {
+                response["content"] = text
+            }
+        }
+
+        // response.headers를 request.headers와 같은 형식으로 변환
+        if headers, ok := response["headers"].([]interface{}); ok {
+            newHeaders := make([]map[string]string, 0, len(headers))
+            for _, header := range headers {
+                if h, ok := header.(map[string]interface{}); ok {
+                    name, _ := h["name"].(string)
+                    value, _ := h["value"].(string)
+                    newHeaders = append(newHeaders, map[string]string{name: value})
+                }
+            }
+            response["headers"] = newHeaders
+        }
+    }
+
+    // 8. .startedDateTime 필드 제거
+    delete(data, "startedDateTime")
+
+    // 9. a-response-time을 a-response-time-ms로 이름 변경
+    if responseTime, exists := data["a-response-time"]; exists {
+        data["a-response-time-ms"] = responseTime
+        delete(data, "a-response-time")
+    }
+
+    // 변환된 데이터를 JSON으로 직렬화
+    output, err := json.Marshal(data)
+    if err != nil {
+        return nil
+    }
+    return output
+}
+
+// 전역 변수
+var (
+    logStreamsMap = make(map[string]string) // process_command_line -> logStreamName
+    mutex         sync.Mutex
+)
+
+func (p *Parser) sendReflector(tags map[string]string, json []byte) error {
+    // 콘솔에 출력
+    fmt.Printf("%s %s\n", tags, transformJSON(json))
+
+    // AWS SDK v2 설정
+    cfg, err := config.LoadDefaultConfig(context.TODO(),
+        config.WithRegion(os.Getenv("AWS_REGION_NAME")),
+        config.WithCredentialsProvider(aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+            return aws.Credentials{
+                AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
+                SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+            }, nil
+        })),
+    )
+    if err != nil {
+        return fmt.Errorf("unable to load AWS config: %w", err)
+    }
+
+    // CloudWatch Logs 클라이언트 생성
+    client := cloudwatchlogs.NewFromConfig(cfg)
+
+    // 로그 그룹 이름 고정
+    logGroupName := "/proxy-logging"
+
+    // process_command_line 가져오기
+    processCommandLine, ok := tags["process_command_line"]
+    if !ok {
+        processCommandLine = "unknown" // tags에 process_command_line이 없는 경우 기본값
+    }
+
+    // 로그 스트림 이름 가져오기 또는 생성
+    mutex.Lock()
+    logStreamName, exists := logStreamsMap[processCommandLine]
+    if !exists {
+        // 최초 생성: {process_command_line} {HH.MM.SS}
+        currentTime := time.Now().Format("15.04.05") // HH.MM.SS 형식
+        logStreamName = fmt.Sprintf("%s %s", processCommandLine, currentTime)
+        logStreamsMap[processCommandLine] = logStreamName
+
+        // 로그 스트림 생성
+        _, err = client.CreateLogStream(context.TODO(), &cloudwatchlogs.CreateLogStreamInput{
+            LogGroupName:  aws.String(logGroupName),
+            LogStreamName: aws.String(logStreamName),
+        })
+        if err != nil {
+            mutex.Unlock()
+            return fmt.Errorf("failed to create log stream: %w", err)
+        }
+    }
+    mutex.Unlock()
+
+    // 로그 이벤트 생성
+    logEvent := types.InputLogEvent{
+        Message:   aws.String(string(transformJSON(json))),
+        Timestamp: aws.Int64(time.Now().UnixNano() / int64(time.Millisecond)),
+    }
+
+    // CloudWatch Logs에 로그 이벤트 전송
+    _, err = client.PutLogEvents(context.TODO(), &cloudwatchlogs.PutLogEventsInput{
+        LogGroupName:  aws.String(logGroupName),
+        LogStreamName: aws.String(logStreamName),
+        LogEvents:     []types.InputLogEvent{logEvent},
+    })
+    if err != nil {
+        return fmt.Errorf("failed to put log events: %w", err)
+    }
+
+    return nil
 }
 
 type sampler struct {
