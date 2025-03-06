@@ -321,6 +321,13 @@ func generateCurlCommand(request map[string]interface{}) string {
     return curl
 }
 
+go
+
+Collapse
+
+Wrap
+
+Copy
 func transformJSON(input []byte) ([]byte) {
     // JSON을 map으로 파싱
     var data map[string]interface{}
@@ -403,6 +410,13 @@ func transformJSON(input []byte) ([]byte) {
             }
             response["headers"] = newHeaders
         }
+
+        // .response.status가 2xx가 아닌 경우 abnormal-response 추가
+        if status, ok := response["status"].(float64); ok {
+            if status < 200 || status >= 300 {
+                data["abnormal-response"] = true
+            }
+        }
     }
 
     // 8. .startedDateTime 필드 제거
@@ -430,7 +444,7 @@ var (
 
 func (p *Parser) sendReflector(tags map[string]string, json []byte) error {
     // 콘솔에 출력
-    fmt.Printf("%s %s\n", tags, transformJSON(json))
+    // fmt.Printf("%s %s\n", tags, transformJSON(json))
 
     // AWS SDK v2 설정
     cfg, err := config.LoadDefaultConfig(context.TODO(),
