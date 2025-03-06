@@ -16,24 +16,15 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21' # 원하는 Go 버전
+          go-version: '1.24' # 원하는 Go 버전
 
-      - name: Build for AMD64
+      - name: Build
         run: |
-          go get main.go
-          go mod tidy
-          GOOS=linux GOARCH=amd64 go build -o subtrace-x86_64 main.go
+          bash make.sh
           
-      - name: Build for ARM64
-        run: |
-          go get main.go
-          go mod tidy
-          GOOS=linux GOARCH=arm64 go build -o subtrace-aarch64 main.go
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binaries
           path: |
-            subtrace-amd64
-            subtrace-arm64
+            subtrace
