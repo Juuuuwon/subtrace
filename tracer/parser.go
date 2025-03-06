@@ -421,6 +421,12 @@ func transformJSON(input []byte) ([]byte) {
         delete(data, "a-response-time")
     }
 
+	// 10. cache를 z-cache로 이름 변경
+	if cache, exists := data["cache"]; exists {
+        data["z-cache"] = cache
+        delete(data, "cache")
+    }
+
     // 변환된 데이터를 JSON으로 직렬화
     output, err := json.Marshal(data)
     if err != nil {
