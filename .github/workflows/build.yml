@@ -20,10 +20,12 @@ jobs:
 
       - name: Build for AMD64
         run: |
+          go mod tidy
           GOOS=linux GOARCH=amd64 go build -o subtrace-x86_64 main.go
           
       - name: Build for ARM64
         run: |
+          go mod tidy
           GOOS=linux GOARCH=arm64 go build -o subtrace-aarch64 main.go
 
       - name: Upload artifacts
