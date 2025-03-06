@@ -452,6 +452,26 @@ func (p *Parser) sendReflector(tags map[string]string, json []byte) error {
     // 로그 그룹 이름 고정
     logGroupName := "/proxy-logging"
 
+	var output *cloudwatchlogs.DescribeLogGroupsOutput
+
+    // 로그 그룹이 존재하는지 확인하고, 없으면 생성
+    output, err = client.DescribeLogGroups(context.TODO(), &cloudwatchlogs.DescribeLogGroupsInput{
+        LogGroupNamePrefix: aws.String(logGroupName),
+    })
+	if err != nil {
+		return fmt.Errorf("failed to search log groups: %w", err)
+	}
+
+	if len(output.LogGroups) == 0 {
+		// 로그 그룹이 없으면 새로 생성
+		_, err = client.CreateLogGroup(context.TODO(), &cloudwatchlogs.CreateLogGroupInput{
+			LogGroupName: aws.String(logGroupName),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create log group: %w", err)
+		}
+    }
+
     // process_command_line 가져오기
     processCommandLine, ok := tags["process_command_line"]
     if !ok {
@@ -497,6 +517,8 @@ func (p *Parser) sendReflector(tags map[string]string, json []byte) error {
 
     return nil
 }
+// 수정----------------------------------------------------------------------------------------------
+
 
 type sampler struct {
 	orig io.ReadCloser
