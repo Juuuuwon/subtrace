@@ -321,13 +321,6 @@ func generateCurlCommand(request map[string]interface{}) string {
     return curl
 }
 
-go
-
-Collapse
-
-Wrap
-
-Copy
 func transformJSON(input []byte) ([]byte) {
     // JSON을 map으로 파싱
     var data map[string]interface{}
