@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -272,172 +273,152 @@ func (p *Parser) Finish() error {
 }
 
 // 수정----------------------------------------------------------------------------------------------
-// generateCurlCommand는 request 객체를 기반으로 curl 명령어를 생성합니다.
-func generateCurlCommand(request map[string]interface{}) string {
-    method, _ := request["method"].(string)
-    url, _ := request["url"].(string)
-    headers, _ := request["headers"].([]map[string]string)
-    postData, _ := request["postData"].(map[string]interface{})
+func transformJSON(input []byte) []byte {
+	// JSON을 map으로 파싱
+	var data map[string]interface{}
+	if err := json.Unmarshal(input, &data); err != nil {
+		return nil
+	}
 
-    // 1. Host 헤더에서 호스트 정보를 추출하여 URL에 포함
-    host := ""
-    for _, header := range headers {
-        for name, value := range header {
-            if strings.ToLower(name) == "host" {
-                host = value
-                break
-            }
-        }
-        if host != "" {
-            break
-        }
-    }
-    if host != "" {
-        url = host + url // 예: localhost:8080/path
-    }
+	// 1. 지정된 필드 제거 (기존 로직 유지)
+	delete(data, "time")
+	delete(data, "cache")
+	if request, ok := data["request"].(map[string]interface{}); ok {
+		delete(request, "bodySize")
+		delete(request, "headersSize")
+		delete(request, "httpVersion")
+	}
+	if response, ok := data["response"].(map[string]interface{}); ok {
+		delete(response, "bodySize")
+		delete(response, "headersSize")
+		delete(response, "httpVersion")
+		delete(response, "statusText")
+	}
+	delete(data, "startedDateTime")
+	delete(data, "timings")
 
-    // 2. curl 명령어 초기화
-    curl := "curl -X " + method
+	// 2. headers와 queryString을 map[string]string 형태로 변환 (기존 로직 유지)
+	if request, ok := data["request"].(map[string]interface{}); ok {
+		if headers, ok := request["headers"].([]interface{}); ok {
+			headerMap := make(map[string]string)
+			for _, h := range headers {
+				if header, ok := h.(map[string]interface{}); ok {
+					name := header["name"].(string)
+					value := header["value"].(string)
+					headerMap[name] = value
+				}
+			}
+			request["headers"] = headerMap
+		} else if headers, ok := request["headers"].(map[string]interface{}); ok {
+			headerMap := make(map[string]string)
+			for name, value := range headers {
+				if v, ok := value.(string); ok {
+					headerMap[name] = v
+				}
+			}
+			request["headers"] = headerMap
+		}
+		if queryString, ok := request["queryString"].([]interface{}); ok {
+			queryMap := make(map[string]string)
+			for _, q := range queryString {
+				if query, ok := q.(map[string]interface{}); ok {
+					name := query["name"].(string)
+					value := query["value"].(string)
+					queryMap[name] = value
+				}
+			}
+			request["queryString"] = queryMap
+		}
+	}
+	if response, ok := data["response"].(map[string]interface{}); ok {
+		if headers, ok := response["headers"].([]interface{}); ok {
+			headerMap := make(map[string]string)
+			for _, h := range headers {
+				if header, ok := h.(map[string]interface{}); ok {
+					name := header["name"].(string)
+					value := header["value"].(string)
+					headerMap[name] = value
+				}
+			}
+			response["headers"] = headerMap
+		}
+	}
 
-    // 3. POST 데이터 추가 (-d를 앞으로 배치)
-    if method == "POST" && postData != nil {
-        text, _ := postData["text"].(string)
-        curl += " -d " + text
-    }
+	// 3. status가 2xx가 아닐 때 .abnormal-response 추가 (기존 로직 유지)
+	if response, ok := data["response"].(map[string]interface{}); ok {
+		if status, ok := response["status"].(float64); ok {
+			if status < 200 || status >= 300 {
+				data["abnormal-response"] = true
+			}
+		}
+	}
 
-    // 4. 헤더 추가 (Host와 Content-Length 제외, 작은따옴표 사용)
-    for _, header := range headers {
-        for name, value := range header {
-            lowerName := strings.ToLower(name)
-            if lowerName != "host" && lowerName != "content-length" {
-                curl += " -H '" + name + ": " + value + "'"
-            }
-        }
-    }
+	// 4. .curl 필드 추가 (수정된 로직)
+	if request, ok := data["request"].(map[string]interface{}); ok {
+		method := request["method"].(string)
+		urlStr := request["url"].(string)
+		headers := request["headers"].(map[string]string)
+		var curlParts []string
 
-    // 5. URL을 작은따옴표로 감싸고 마지막에 추가
-    curl += " '" + url + "'"
+		// POST 데이터 처리 (-d 옵션, POST일 경우만 추가)
+		if method == "POST" {
+			if postData, ok := request["postData"].(map[string]interface{}); ok {
+				if text, ok := postData["text"].(string); ok {
+					curlParts = append(curlParts, fmt.Sprintf("-d '%s'", text))
+				}
+			}
+		}
 
-    return curl
-}
+		// URL 추가
+		curlParts = append(curlParts, fmt.Sprintf("%q", urlStr))
 
-func transformJSON(input []byte) ([]byte) {
-    // JSON을 map으로 파싱
-    var data map[string]interface{}
-    if err := json.Unmarshal(input, &data); err != nil {
-        return nil
-    }
+		// 헤더 추가 (-H 옵션)
+		for name, value := range headers {
+			if name != "Content-Length" && name != "Host" {
+				curlParts = append(curlParts, fmt.Sprintf("-H %q", fmt.Sprintf("%s: %s", name, value)))
+			}
+		}
 
-    // 1. .timings 필드 제거
-    delete(data, "timings")
+		// 메서드 추가 (-X 옵션)
+		curlParts = append(curlParts, fmt.Sprintf("-X %s", method))
 
-    // 2. ._id 필드 제거
-    delete(data, "_id")
+		// 최종 curl 명령어 조합
+		curl := "curl " + strings.Join(curlParts, " ")
+		data["curl"] = curl
 
-    // 3. .time 필드를 .a-response-time으로 이름 변경
-    if timeVal, exists := data["time"]; exists {
-        data["a-response-time"] = timeVal
-        delete(data, "time")
-    }
+		// 5. .request.path 필드 추가 (기존 로직 유지)
+		parsedURL, err := url.Parse(urlStr)
+		if err == nil {
+			request["path"] = parsedURL.Path // 쿼리 파라미터 제외한 경로만 추출
+		}
+	}
 
-    // 4. .request.headers 변환 및 curl-command 추가
-    if request, ok := data["request"].(map[string]interface{}); ok {
-        // 헤더 변환
-        if headers, ok := request["headers"].([]interface{}); ok {
-            newHeaders := make([]map[string]string, 0, len(headers))
-            for _, header := range headers {
-                if h, ok := header.(map[string]interface{}); ok {
-                    name, _ := h["name"].(string)
-                    value, _ := h["value"].(string)
-                    if name == "" && value == "" { // 이미 변환된 경우
-                        for k, v := range h {
-                            newHeaders = append(newHeaders, map[string]string{k: v.(string)})
-                        }
-                    } else {
-                        newHeaders = append(newHeaders, map[string]string{name: value})
-                    }
-                }
-            }
-            request["headers"] = newHeaders
-        }
+	// 6. .response.content.encoding == base64일 때 디코딩 처리 (기존 로직 유지)
+	if response, ok := data["response"].(map[string]interface{}); ok {
+		if content, ok := response["content"].(map[string]interface{}); ok {
+			if encoding, ok := content["encoding"].(string); ok && encoding == "base64" {
+				if text, ok := content["text"].(string); ok {
+					decoded, err := base64.StdEncoding.DecodeString(text)
+					if err == nil {
+						response["text"] = string(decoded)
+					}
+					delete(response, "content")
+				}
+			}
+		}
+	}
 
-        // 5. headersSize, bodySize 제거
-        delete(request, "headersSize")
-        delete(request, "bodySize")
-
-        // 6. curl-command 생성 및 추가
-        curlCommand := generateCurlCommand(request)
-        data["curl-command"] = curlCommand
-    }
-
-    // 7. .response 처리
-    if response, ok := data["response"].(map[string]interface{}); ok {
-        delete(response, "headersSize")
-        delete(response, "bodySize")
-
-        // base64 디코딩 및 response.content.text를 response.content로 복사
-        if content, ok := response["content"].(map[string]interface{}); ok {
-            if encoding, ok := content["encoding"].(string); ok && encoding == "base64" {
-                if text, ok := content["text"].(string); ok {
-                    decoded, err := base64.StdEncoding.DecodeString(text)
-                    if err == nil {
-                        content["text"] = string(decoded)
-                    }
-                }
-            }
-            // response.content를 response.content.text로 대체
-            if text, ok := content["text"].(string); ok {
-                response["content"] = text
-            }
-        }
-
-        // response.headers를 request.headers와 같은 형식으로 변환
-        if headers, ok := response["headers"].([]interface{}); ok {
-            newHeaders := make([]map[string]string, 0, len(headers))
-            for _, header := range headers {
-                if h, ok := header.(map[string]interface{}); ok {
-                    name, _ := h["name"].(string)
-                    value, _ := h["value"].(string)
-                    newHeaders = append(newHeaders, map[string]string{name: value})
-                }
-            }
-            response["headers"] = newHeaders
-        }
-
-        // .response.status가 2xx가 아닌 경우 abnormal-response 추가
-        if status, ok := response["status"].(float64); ok {
-            if status < 200 || status >= 300 {
-                data["abnormal-response"] = true
-            }
-        }
-    }
-
-    // 8. .startedDateTime 필드 제거
-    delete(data, "startedDateTime")
-
-    // 9. a-response-time을 a-response-time-ms로 이름 변경
-    if responseTime, exists := data["a-response-time"]; exists {
-        data["a-response-time-ms"] = responseTime
-        delete(data, "a-response-time")
-    }
-
-	// 10. cache를 z-cache로 이름 변경
-	if cache, exists := data["cache"]; exists {
-        data["z-cache"] = cache
-        delete(data, "cache")
-    }
-
-    // 변환된 데이터를 JSON으로 직렬화
-    output, err := json.Marshal(data)
-    if err != nil {
-        return nil
-    }
-    return output
+	// 변환된 데이터를 JSON으로 직렬화
+	output, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+	return output
 }
 
 // 전역 변수
 var (
-    logStreamsMap = make(map[string]string) // process_command_line -> logStreamName
+    logStreamsMap = make(map[string]string)
     mutex         sync.Mutex
 )
 
