@@ -281,7 +281,6 @@ func transformJSON(input []byte) []byte {
 	}
 
 	// 1. 지정된 필드 제거 (기존 로직 유지)
-	delete(data, "time")
 	delete(data, "cache")
 	if request, ok := data["request"].(map[string]interface{}); ok {
 		delete(request, "bodySize")
