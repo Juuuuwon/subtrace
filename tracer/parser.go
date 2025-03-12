@@ -15,9 +15,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"os"
 	"strings"
 	"sync"
+	"sort"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -273,6 +275,17 @@ func (p *Parser) Finish() error {
 }
 
 // 수정----------------------------------------------------------------------------------------------
+var sloThreshold float64
+
+func init() {
+	sloThreshold = 200.0 // 기본값
+	if sloStr := os.Getenv("SLO"); sloStr != "" {
+		if val, err := strconv.ParseFloat(sloStr, 64); err == nil {
+			sloThreshold = val
+		}
+	}
+}
+
 func transformJSON(input []byte) []byte {
 	// JSON을 map으로 파싱
 	var data map[string]interface{}
@@ -280,7 +293,7 @@ func transformJSON(input []byte) []byte {
 		return nil
 	}
 
-	// 1. 지정된 필드 제거 (기존 로직 유지)
+	// 1. 지정된 필드 제거
 	delete(data, "cache")
 	if request, ok := data["request"].(map[string]interface{}); ok {
 		delete(request, "bodySize")
@@ -296,7 +309,13 @@ func transformJSON(input []byte) []byte {
 	delete(data, "startedDateTime")
 	delete(data, "timings")
 
-	// 2. headers와 queryString을 map[string]string 형태로 변환 (기존 로직 유지)
+	// "time"을 "A-time"으로 변경
+	if timeVal, ok := data["time"]; ok {
+		data["A-time"] = timeVal
+		delete(data, "time")
+	}
+
+	// 2. headers와 queryString을 map[string]string 형태로 변환
 	if request, ok := data["request"].(map[string]interface{}); ok {
 		if headers, ok := request["headers"].([]interface{}); ok {
 			headerMap := make(map[string]string)
@@ -343,19 +362,31 @@ func transformJSON(input []byte) []byte {
 		}
 	}
 
-	// 3. status가 2xx가 아닐 때 .abnormal-response 추가 (기존 로직 유지)
+	// 3. status가 2xx가 아닐 때 또는 A-time이 SLO보다 클 때 .abnormal-response 추가
 	if response, ok := data["response"].(map[string]interface{}); ok {
+		var abnormalReasons []string
+
 		if status, ok := response["status"].(float64); ok {
 			if status < 200 || status >= 300 {
-				data["abnormal-response"] = true
+				abnormalReasons = append(abnormalReasons, "status-error")
 			}
+		}
+
+		if aTime, ok := data["A-time"].(float64); ok {
+			if aTime > sloThreshold {
+				abnormalReasons = append(abnormalReasons, "slo-violation")
+			}
+		}
+
+		if len(abnormalReasons) > 0 {
+			data["abnormal-response"] = strings.Join(abnormalReasons, ",")
 		}
 	}
 
-	// 4. .curl 필드 추가 (수정된 로직)
+	// 4. .curl 필드 추가
 	if request, ok := data["request"].(map[string]interface{}); ok {
 		method := request["method"].(string)
-		urlStr := request["url"].(string)
+		urlStr := "${SERVER_URL}" + request["url"].(string)
 		headers := request["headers"].(map[string]string)
 		var curlParts []string
 
@@ -369,30 +400,33 @@ func transformJSON(input []byte) []byte {
 		}
 
 		// URL 추가
-		curlParts = append(curlParts, fmt.Sprintf("%q", urlStr))
+		curlParts = append(curlParts, fmt.Sprintf("'%s'", urlStr))
 
-		// 헤더 추가 (-H 옵션)
+		// 헤더 추가
 		for name, value := range headers {
 			if name != "Content-Length" && name != "Host" {
-				curlParts = append(curlParts, fmt.Sprintf("-H %q", fmt.Sprintf("%s: %s", name, value)))
+				curlParts = append(curlParts, fmt.Sprintf("-H '%s'", fmt.Sprintf("%s: %s", name, value)))
 			}
 		}
 
 		// 메서드 추가 (-X 옵션)
 		curlParts = append(curlParts, fmt.Sprintf("-X %s", method))
 
+		// 파라미터 정렬
+		sort.Strings(curlParts)
+
 		// 최종 curl 명령어 조합
 		curl := "curl " + strings.Join(curlParts, " ")
-		data["curl"] = curl
+		data["A-curl"] = curl // 이미 A-curl로 되어 있음
 
-		// 5. .request.path 필드 추가 (기존 로직 유지)
+		// 5. .request.path 필드 추가
 		parsedURL, err := url.Parse(urlStr)
 		if err == nil {
-			request["path"] = parsedURL.Path // 쿼리 파라미터 제외한 경로만 추출
+			request["path"] = parsedURL.Path
 		}
 	}
 
-	// 6. .response.content.encoding == base64일 때 디코딩 처리 (기존 로직 유지)
+	// 6. .response.content.encoding == base64일 때 디코딩 처리
 	if response, ok := data["response"].(map[string]interface{}); ok {
 		if content, ok := response["content"].(map[string]interface{}); ok {
 			if encoding, ok := content["encoding"].(string); ok && encoding == "base64" {
