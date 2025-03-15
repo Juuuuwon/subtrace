@@ -468,19 +468,19 @@ func (p *Parser) sendReflector(tags map[string]string, json []byte) error {
     logGroupName := "/proxy-logging"
 
     // process_command_line 가져오기
-    processCommandLine, ok := tags["process_command_line"]
+    processExecutableName, ok := tags["process_executable_name"]
     if !ok {
-        processCommandLine = "unknown" // tags에 process_command_line이 없는 경우 기본값
+        processExecutableName = "unknown" // tags에 process_command_line이 없는 경우 기본값
     }
 
     // 로그 스트림 이름 가져오기 또는 생성
     mutex.Lock()
-    logStreamName, exists := logStreamsMap[processCommandLine]
+    logStreamName, exists := logStreamsMap[processExecutableName]
     if !exists {
         // 최초 생성: {process_command_line} {HH.MM.SS}
         currentTime := time.Now().Format("15.04.05") // HH.MM.SS 형식
-        logStreamName = fmt.Sprintf("%s %s", processCommandLine, currentTime)
-        logStreamsMap[processCommandLine] = logStreamName
+        logStreamName = fmt.Sprintf("%s %s", processExecutableName, currentTime)
+        logStreamsMap[processExecutableName] = logStreamName
 
         // 로그 스트림 생성
         _, err = client.CreateLogStream(context.TODO(), &cloudwatchlogs.CreateLogStreamInput{
