@@ -286,7 +286,7 @@ func init() {
 	}
 }
 
-func transformJSON(input []byte) []byte {
+func transformJSON(tags map[string]string, input []byte) []byte {
 	// JSON을 map으로 파싱
 	var data map[string]interface{}
 	if err := json.Unmarshal(input, &data); err != nil {
@@ -327,14 +327,6 @@ func transformJSON(input []byte) []byte {
 				}
 			}
 			request["headers"] = headerMap
-		} else if headers, ok := request["headers"].(map[string]interface{}); ok {
-			headerMap := make(map[string]string)
-			for name, value := range headers {
-				if v, ok := value.(string); ok {
-					headerMap[name] = v
-				}
-			}
-			request["headers"] = headerMap
 		}
 		if queryString, ok := request["queryString"].([]interface{}); ok {
 			queryMap := make(map[string]string)
@@ -347,7 +339,12 @@ func transformJSON(input []byte) []byte {
 			}
 			request["queryString"] = queryMap
 		}
+
+		if url, ok := request["url"].(string); ok {
+			request["parsed_url"] = strings.Split(url, "?")[0]
+		}
 	}
+
 	if response, ok := data["response"].(map[string]interface{}); ok {
 		if headers, ok := response["headers"].([]interface{}); ok {
 			headerMap := make(map[string]string)
@@ -365,19 +362,16 @@ func transformJSON(input []byte) []byte {
 	// 3. status가 2xx가 아닐 때 또는 A-time이 SLO보다 클 때 .abnormal-response 추가
 	if response, ok := data["response"].(map[string]interface{}); ok {
 		var abnormalReasons []string
-
 		if status, ok := response["status"].(float64); ok {
 			if status < 200 || status >= 300 {
 				abnormalReasons = append(abnormalReasons, "status-error")
 			}
 		}
-
 		if aTime, ok := data["A-time"].(float64); ok {
 			if aTime > sloThreshold {
 				abnormalReasons = append(abnormalReasons, "slo-violation")
 			}
 		}
-
 		if len(abnormalReasons) > 0 {
 			data["abnormal-response"] = strings.Join(abnormalReasons, ",")
 		}
@@ -390,7 +384,6 @@ func transformJSON(input []byte) []byte {
 		headers := request["headers"].(map[string]string)
 		var curlParts []string
 
-		// POST 데이터 처리 (-d 옵션, POST일 경우만 추가)
 		if method == "POST" {
 			if postData, ok := request["postData"].(map[string]interface{}); ok {
 				if text, ok := postData["text"].(string); ok {
@@ -398,26 +391,16 @@ func transformJSON(input []byte) []byte {
 				}
 			}
 		}
-
-		// URL 추가
 		curlParts = append(curlParts, fmt.Sprintf("'%s'", urlStr))
-
-		// 헤더 추가
 		for name, value := range headers {
 			if name != "Content-Length" && name != "Host" {
 				curlParts = append(curlParts, fmt.Sprintf("-H '%s'", fmt.Sprintf("%s: %s", name, value)))
 			}
 		}
-
-		// 메서드 추가 (-X 옵션)
 		curlParts = append(curlParts, fmt.Sprintf("-X %s", method))
-
-		// 파라미터 정렬
 		sort.Strings(curlParts)
-
-		// 최종 curl 명령어 조합
 		curl := "curl " + strings.Join(curlParts, " ")
-		data["A-curl"] = curl // 이미 A-curl로 되어 있음
+		data["A-curl"] = curl
 
 		// 5. .request.path 필드 추가
 		parsedURL, err := url.Parse(urlStr)
@@ -439,6 +422,11 @@ func transformJSON(input []byte) []byte {
 				}
 			}
 		}
+	}
+
+	// 7. tags에서 process_executable_name을 JSON에 추가
+	if processName, ok := tags["process_executable_name"]; ok {
+		data["_process_executable_name"] = processName
 	}
 
 	// 변환된 데이터를 JSON으로 직렬화
@@ -508,7 +496,7 @@ func (p *Parser) sendReflector(tags map[string]string, json []byte) error {
 
     // 로그 이벤트 생성
     logEvent := types.InputLogEvent{
-        Message:   aws.String(string(transformJSON(json))),
+        Message:   aws.String(string(transformJSON(tags, json))),
         Timestamp: aws.Int64(time.Now().UnixNano() / int64(time.Millisecond)),
     }
 
