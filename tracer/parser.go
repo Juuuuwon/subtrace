@@ -420,7 +420,7 @@ func transformJSON(tags map[string]string, input []byte) []byte {
 				}
 			}
 		}
-		curlParts = append(curlParts, fmt.Sprintf("'%s'", urlStr))
+		curlParts = append(curlParts, fmt.Sprintf("\"%s\"", urlStr))
 		for name, value := range headers {
 			if name != "Content-Length" && name != "Host" {
 				curlParts = append(curlParts, fmt.Sprintf("-H '%s'", fmt.Sprintf("%s: %s", name, value)))
