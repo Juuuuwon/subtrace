@@ -9,6 +9,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"context"
+	"log"
+	"strconv"
+	"sort"
+	"net/url"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,14 +23,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/andybalholm/brotli"
 	"github.com/google/martian/v3/har"
-	"google.golang.org/protobuf/proto"
 	"subtrace.dev/cmd/run/journal"
 	"subtrace.dev/event"
 	"subtrace.dev/filter"
 	"subtrace.dev/global"
-	"subtrace.dev/pubsub"
 	"subtrace.dev/stats"
 )
 
@@ -280,37 +287,221 @@ func (p *Parser) Finish() error {
 	return nil
 }
 
-func (p *Parser) sendReflector(tags map[string]string, json []byte, loglines []string) error {
-	b, err := proto.Marshal(&pubsub.Message{
-		Concrete: &pubsub.Message_ConcreteV1{
-			ConcreteV1: &pubsub.Message_V1{
-				Underlying: &pubsub.Message_V1_Event{
-					Event: &pubsub.Event{
-						Concrete: &pubsub.Event_ConcreteV1{
-							ConcreteV1: &pubsub.Event_V1{
-								Tags:         tags,
-								HarEntryJson: json,
-								Log: &pubsub.Event_Log{
-									Lines: loglines,
-									Index: p.journalIdx + 1,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	})
+// 수정 ------------------------------------------------------------------------------------------------------------------------------------
+var once sync.Once
+var sloThreshold float64
+var logStreamName string
+var logGroupName string
+var (
+	cfg    aws.Config
+	client *cloudwatchlogs.Client
+	err    error
+)
+
+func init() {
+	cfg, err = config.LoadDefaultConfig(context.TODO(), config.WithRegion(os.Getenv("AWS_REGION_NAME")))
 	if err != nil {
-		return fmt.Errorf("marshal proto: %w", err)
+		log.Fatalf("AWS 설정 로드 실패: %v", err)
 	}
 
-	select {
-	case DefaultPublisher.ch <- b:
-		return nil
-	default:
-		return fmt.Errorf("publisher channel buffer full")
+	client = cloudwatchlogs.NewFromConfig(cfg)
+	logGroupName = "/proxy-logging"
+
+	sloThreshold = 200.0 // 기본값
+	if sloStr := os.Getenv("SLO"); sloStr != "" {
+		if val, err := strconv.ParseFloat(sloStr, 64); err == nil {
+			sloThreshold = val
+		}
 	}
+}
+
+func transformJSON(tags map[string]string, input []byte) []byte {
+	// JSON을 map으로 파싱
+	var data map[string]interface{}
+	if err := json.Unmarshal(input, &data); err != nil {
+		return nil
+	}
+
+	// 1. 지정된 필드 제거
+	delete(data, "cache")
+	if request, ok := data["request"].(map[string]interface{}); ok {
+		delete(request, "bodySize")
+		delete(request, "headersSize")
+		delete(request, "httpVersion")
+	}
+	if response, ok := data["response"].(map[string]interface{}); ok {
+		delete(response, "bodySize")
+		delete(response, "headersSize")
+		delete(response, "httpVersion")
+		delete(response, "statusText")
+	}
+	delete(data, "startedDateTime")
+	delete(data, "timings")
+
+	// "time"을 "A-time"으로 변경
+	if timeVal, ok := data["time"]; ok {
+		data["A-time"] = timeVal
+		delete(data, "time")
+	}
+
+	// 2. headers와 queryString을 map[string]string 형태로 변환
+	if request, ok := data["request"].(map[string]interface{}); ok {
+		if headers, ok := request["headers"].([]interface{}); ok {
+			headerMap := make(map[string]string)
+			for _, h := range headers {
+				if header, ok := h.(map[string]interface{}); ok {
+					name := header["name"].(string)
+					value := header["value"].(string)
+					headerMap[name] = value
+				}
+			}
+			request["headers"] = headerMap
+		}
+		if queryString, ok := request["queryString"].([]interface{}); ok {
+			queryMap := make(map[string]string)
+			for _, q := range queryString {
+				if query, ok := q.(map[string]interface{}); ok {
+					name := query["name"].(string)
+					value := query["value"].(string)
+					queryMap[name] = value
+				}
+			}
+			request["queryString"] = queryMap
+		}
+
+		if url, ok := request["url"].(string); ok {
+			request["parsed_url"] = strings.Split(url, "?")[0]
+		}
+	}
+
+	if response, ok := data["response"].(map[string]interface{}); ok {
+		if headers, ok := response["headers"].([]interface{}); ok {
+			headerMap := make(map[string]string)
+			for _, h := range headers {
+				if header, ok := h.(map[string]interface{}); ok {
+					name := header["name"].(string)
+					value := header["value"].(string)
+					headerMap[name] = value
+				}
+			}
+			response["headers"] = headerMap
+		}
+	}
+
+	// 3. status가 2xx가 아닐 때 또는 A-time이 SLO보다 클 때 .abnormal-response 추가
+	if response, ok := data["response"].(map[string]interface{}); ok {
+		var abnormalReasons []string
+		if status, ok := response["status"].(float64); ok {
+			if status < 200 || status >= 300 {
+				abnormalReasons = append(abnormalReasons, "status-error")
+			}
+		}
+		if aTime, ok := data["A-time"].(float64); ok {
+			if aTime > sloThreshold {
+				abnormalReasons = append(abnormalReasons, "slo-violation")
+			}
+		}
+		if len(abnormalReasons) > 0 {
+			data["abnormal-response"] = strings.Join(abnormalReasons, ",")
+		}
+	}
+
+	// 4. .curl 필드 추가
+	if request, ok := data["request"].(map[string]interface{}); ok {
+		method := request["method"].(string)
+		urlStr := "${SERVER_URL}" + request["url"].(string)
+		headers := request["headers"].(map[string]string)
+		var curlParts []string
+
+		if method == "POST" {
+			if postData, ok := request["postData"].(map[string]interface{}); ok {
+				if text, ok := postData["text"].(string); ok {
+					curlParts = append(curlParts, fmt.Sprintf("-d '%s'", text))
+				}
+			}
+		}
+		curlParts = append(curlParts, fmt.Sprintf("'%s'", urlStr))
+		for name, value := range headers {
+			if name != "Content-Length" && name != "Host" {
+				curlParts = append(curlParts, fmt.Sprintf("-H '%s'", fmt.Sprintf("%s: %s", name, value)))
+			}
+		}
+		curlParts = append(curlParts, fmt.Sprintf("-X %s", method))
+		sort.Strings(curlParts)
+		curl := "curl " + strings.Join(curlParts, " ")
+		data["A-curl"] = curl
+
+		// 5. .request.path 필드 추가
+		parsedURL, err := url.Parse(urlStr)
+		if err == nil {
+			request["path"] = parsedURL.Path
+		}
+	}
+
+	// 6. .response.content.encoding == base64일 때 디코딩 처리
+	if response, ok := data["response"].(map[string]interface{}); ok {
+		if content, ok := response["content"].(map[string]interface{}); ok {
+			if encoding, ok := content["encoding"].(string); ok && encoding == "base64" {
+				if text, ok := content["text"].(string); ok {
+					decoded, err := base64.StdEncoding.DecodeString(text)
+					if err == nil {
+						response["text"] = string(decoded)
+					}
+					delete(response, "content")
+				}
+			}
+		}
+	}
+
+	// 7. tags에서 process_executable_name을 JSON에 추가
+	if processName, ok := tags["process_executable_name"]; ok {
+		data["_process_executable_name"] = processName
+	}
+
+	// 변환된 데이터를 JSON으로 직렬화
+	output, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+	return output
+}
+
+
+func CreateLogStream(tags map[string]string) {
+	once.Do(func() {
+		now := time.Now()
+		timeString := now.Format("15.04.05")
+
+		logGroupName = "/proxy-logging"
+		logStreamName = fmt.Sprintf("%s -- %s", tags["process_command_line"], timeString)
+		_, err = client.CreateLogStream(context.TODO(), &cloudwatchlogs.CreateLogStreamInput{
+			LogGroupName:  &logGroupName,
+			LogStreamName: &logStreamName,
+		})
+		if err != nil {
+			log.Fatalf("subtrace: 로그 스트림 생성 실패: %v\n", err)
+		}
+		fmt.Printf("subtrace: 로그 스트림 생성 성공")
+	})
+}
+
+func (p *Parser) sendReflector(tags map[string]string, json []byte, loglines []string) error {
+	CreateLogStream(tags);
+	logEvent := types.InputLogEvent{
+        Message:   aws.String(string(transformJSON(tags, json))),
+        Timestamp: aws.Int64(time.Now().UnixNano() / int64(time.Millisecond)),
+    }
+
+    _, err = client.PutLogEvents(context.TODO(), &cloudwatchlogs.PutLogEventsInput{
+        LogGroupName:  aws.String(logGroupName),
+        LogStreamName: aws.String(logStreamName),
+        LogEvents:     []types.InputLogEvent{logEvent},
+    })
+    if err != nil {
+        return fmt.Errorf("subtrace: 로그 이벤트 전송 실패: %w", err)
+    }
+
+	return nil
 }
 
 type sampler struct {
