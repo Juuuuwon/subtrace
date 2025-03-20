@@ -6,28 +6,28 @@ package tracer
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"context"
-	"log"
-	"strconv"
-	"sort"
-	"net/url"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
-	"github.com/andybalholm/brotli"
 	"github.com/google/martian/v3/har"
 	"subtrace.dev/cmd/run/journal"
 	"subtrace.dev/event"
@@ -473,7 +473,7 @@ func CreateLogStream(tags map[string]string) {
 		timeString := now.Format("15.04.05")
 
 		logGroupName = "/proxy-logging"
-		logStreamName = fmt.Sprintf("%s -- %s", tags["process_command_line"], timeString)
+		logStreamName = fmt.Sprintf("%s -- %s", strings.Split(tags["process_command_line"], " ")[0], timeString)
 		_, err = client.CreateLogStream(context.TODO(), &cloudwatchlogs.CreateLogStreamInput{
 			LogGroupName:  &logGroupName,
 			LogStreamName: &logStreamName,
@@ -497,6 +497,7 @@ func (p *Parser) sendReflector(tags map[string]string, json []byte, loglines []s
         LogStreamName: aws.String(logStreamName),
         LogEvents:     []types.InputLogEvent{logEvent},
     })
+
     if err != nil {
         return fmt.Errorf("subtrace: 로그 이벤트 전송 실패: %w", err)
     }

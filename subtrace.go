@@ -17,6 +17,11 @@ import (
 )
 
 func main() {
+	if os.Getenv("AWS_REGION_NAME") == "" || os.Getenv("AWS_ACCESS_KEY_ID") == "" || os.Getenv("AWS_SECRET_ACCESS_KEY") == "" {
+		fmt.Fprintf(os.Stderr, "subtrace: Environment variable is not set")
+		os.Exit(1)
+	}
+	
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
