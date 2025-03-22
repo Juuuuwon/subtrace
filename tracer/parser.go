@@ -409,7 +409,7 @@ func transformJSON(tags map[string]string, input []byte) []byte {
 	// 4. .curl 필드 추가
 	if request, ok := data["request"].(map[string]interface{}); ok {
 		method := request["method"].(string)
-		urlStr := "${SERVER_URL}" + request["url"].(string)
+		urlStr := request["url"].(string)
 		headers := request["headers"].(map[string]string)
 		var curlParts []string
 
@@ -420,7 +420,7 @@ func transformJSON(tags map[string]string, input []byte) []byte {
 				}
 			}
 		}
-		curlParts = append(curlParts, fmt.Sprintf("\"%s\"", urlStr))
+		curlParts = append(curlParts, fmt.Sprintf("'%s'", urlStr))
 		for name, value := range headers {
 			if name != "Content-Length" && name != "Host" {
 				curlParts = append(curlParts, fmt.Sprintf("-H '%s'", fmt.Sprintf("%s: %s", name, value)))
