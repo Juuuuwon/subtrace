@@ -388,21 +388,17 @@ func transformJSON(tags map[string]string, input []byte) []byte {
 		}
 	}
 
-	// 3. status가 2xx가 아닐 때 또는 A-time이 SLO보다 클 때 .abnormal-response 추가
+	// 3. status가 2xx가 아닐 때 또는 A-time이 SLO보다 클 때 .status-error, .slo-violation 추가
 	if response, ok := data["response"].(map[string]interface{}); ok {
-		var abnormalReasons []string
 		if status, ok := response["status"].(float64); ok {
 			if status < 200 || status >= 300 {
-				abnormalReasons = append(abnormalReasons, "status-error")
+				data["status-error"] = status
 			}
 		}
 		if aTime, ok := data["A-time"].(float64); ok {
 			if aTime > sloThreshold {
-				abnormalReasons = append(abnormalReasons, "slo-violation")
+				data["slo-violation"] = aTime
 			}
-		}
-		if len(abnormalReasons) > 0 {
-			data["abnormal-response"] = strings.Join(abnormalReasons, ",")
 		}
 	}
 
