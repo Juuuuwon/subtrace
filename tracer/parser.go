@@ -463,12 +463,25 @@ func transformJSON(tags map[string]string, input []byte) []byte {
 }
 
 
-func CreateLogStream(tags map[string]string) {
+func CreateLogGroupAndStream(tags map[string]string) {
 	once.Do(func() {
 		now := time.Now()
 		timeString := now.Format("15.04.05")
 
 		logGroupName = "/proxy-logging"
+		_, err := client.CreateLogGroup(context.TODO(), &cloudwatchlogs.CreateLogGroupInput{
+			LogGroupName: aws.String(logGroupName),
+		})
+		if err != nil {
+			// ResourceAlreadyExistsException은 로그 그룹이 이미 존재할 경우 발생하므로 무시
+			if !strings.Contains(err.Error(), "ResourceAlreadyExistsException") {
+				log.Fatalf("subtrace: 로그 그룹 생성 실패: %v\n", err)
+			}
+		} else {
+			fmt.Printf("subtrace: 로그 그룹 생성 성공: %s\n", logGroupName)
+		}
+
+		
 		logStreamName = fmt.Sprintf("%s -- %s", strings.Split(tags["process_command_line"], " ")[0], timeString)
 		_, err = client.CreateLogStream(context.TODO(), &cloudwatchlogs.CreateLogStreamInput{
 			LogGroupName:  &logGroupName,
@@ -477,12 +490,12 @@ func CreateLogStream(tags map[string]string) {
 		if err != nil {
 			log.Fatalf("subtrace: 로그 스트림 생성 실패: %v\n", err)
 		}
-		fmt.Printf("subtrace: 로그 스트림 생성 성공")
+		fmt.Printf("subtrace: 로그 스트림 생성 성공\n")
 	})
 }
 
 func (p *Parser) sendReflector(tags map[string]string, json []byte, loglines []string) error {
-	CreateLogStream(tags);
+	CreateLogGroupAndStream(tags);
 	logEvent := types.InputLogEvent{
         Message:   aws.String(string(transformJSON(tags, json))),
         Timestamp: aws.Int64(time.Now().UnixNano() / int64(time.Millisecond)),
